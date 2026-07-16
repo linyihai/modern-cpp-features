@@ -1324,3 +1324,134 @@ std::sort(std::begin(c), std::end(c));  // 自动调用 c.begin() / c.end()
 | **`std::rbegin/rend` 是 C++14** | 反向迭代器自由函数也是 C++14 |
 | **与 ADL 配合更安全** | 泛型代码中 `std::begin(c)` 比 `c.begin()` 更安全，后者要求类型必须有 `begin` 成员 |
 | **`std::size` 是 C++17** | 泛型获取大小需 C++17，C++11 可用 `std::distance(std::begin(c), std::end(c))` 替代 |
+
+---
+
+## Lambda Capture Initializer 扩展
+
+**C++11 的限制**：在 C++11 中，lambda 捕获列表只能通过 `[=]`（按值复制捕获）或 `[&]`（按引用捕获）或显式列出变量名来捕获。捕获的变量必须与封闭作用域中的变量同名，且只能捕获已有变量，无法通过表达式初始化捕获值。
+
+C++14 引入了 **Lambda 捕获初始化器**（也叫 init-capture），允许使用任意表达式初始化 lambda 捕获。初始化表达式在 lambda **创建时**求值（而不是在调用时），捕获值的名称不需要与封闭作用域中的任何变量相关。
+
+### 1. 基础用法：用表达式初始化捕获
+
+```c++
+int factory(int i) { return i * 10; }
+auto f = [x = factory(2)] { return x; }; // 返回 20
+
+auto generator = [x = 0] () mutable {
+  return x++;
+};
+auto a = generator(); // == 0
+auto b = generator(); // == 1
+auto c = generator(); // == 2
+```
+
+### 2. 移动捕获：捕获仅可移动类型
+
+因为现在可以将值移动（或转发）到 lambda 中，而以前只能通过复制或引用捕获，所以我们现在可以按值捕获仅可移动类型的 lambda。
+
+```c++
+auto p = std::make_unique<int>(1);
+auto task1 = [=] { *p = 5; }; // ERROR: std::unique_ptr 不能被复制
+auto task2 = [p = std::move(p)] { *p = 5; }; // OK: p 被移动构造到闭包对象中
+```
+
+### 3. 引用捕获重命名
+
+使用这个特性，引用捕获可以使用与被引用变量不同的名称。
+
+```c++
+auto x = 1;
+auto f = [&r = x, x = x * 10] {
+  ++r;
+  return r + x;
+};
+f(); // 将 x 设置为 2 并返回 12
+```
+
+### 4. 捕获成员变量（避免悬空 this 指针）
+
+C++11 中捕获成员变量实际是通过捕获 `this` 指针隐式完成的，在异步场景中容易导致悬空指针。C++14 可以显式地将成员变量**按值复制**到闭包中，避免 `this` 生命周期问题。
+
+```c++
+struct Widget {
+  int value;
+  std::function<void()> getCallback() {
+    // C++11: 捕获 this，异步调用时 this 可能已销毁
+    // auto bad = [=] { return value; };
+
+    // C++14: 将成员变量复制到闭包中，安全
+    auto good = [v = value] { return v; };
+    return good;
+  }
+};
+```
+
+### 5. 捕获时进行类型转换
+
+```c++
+std::vector<int> data = {1, 2, 3, 4, 5};
+// 捕获 vector 的大小（而非引用整个 vector）
+auto f = [size = data.size()] { return size; };
+// 或者捕获后转换为其他类型
+auto g = [value = static_cast<double>(data[0])] { return value * 2.5; };
+```
+
+### 6. 完美转发到闭包
+
+结合 `std::forward` 实现完美转发捕获：
+
+```c++
+template <typename T>
+auto makeLambda(T&& arg) {
+  return [captured = std::forward<T>(arg)] {
+    // 使用 captured...
+  };
+}
+```
+
+### 7. 异步/多线程场景：移动所有权到线程
+
+```c++
+auto data = std::make_unique<std::vector<int>>(100);
+// 将 data 的所有权移动到新线程中
+std::thread t([data = std::move(data)] {
+  // 在新线程中独占访问 data
+  (*data)[0] = 42;
+});
+```
+
+### 8. 捕获 mutex 用于线程安全
+
+```c++
+std::mutex mtx;
+int shared_resource = 0;
+// 将 mutex 的引用捕获到闭包中，并给一个更清晰的名称
+auto thread_safe_op = [&lock = mtx, &res = shared_resource] {
+  std::lock_guard<std::mutex> guard(lock);
+  ++res;
+};
+```
+
+### 9. 捕获表达式结果
+
+```c++
+int a = 10, b = 20;
+// 捕获表达式 a + b 的结果，而非 a 和 b 本身
+auto f = [sum = a + b] { return sum; };
+f(); // == 30
+```
+
+### C++11 vs C++14 捕获对比总结
+
+| 场景 | C++11 | C++14 |
+|------|-------|-------|
+| 按值复制已有变量 | `[=]` 或 `[x]` | `[x]` 或 `[x = x]` |
+| 按引用捕获 | `[&]` 或 `[&x]` | `[&x]` 或 `[&r = x]` |
+| 移动捕获 | ❌ 不支持 | `[x = std::move(x)]` |
+| 表达式初始化 | ❌ 不支持 | `[x = factory(2)]` |
+| 捕获成员变量（按值） | ❌ 只能通过 `this` | `[v = this->value]` |
+| 捕获时类型转换 | ❌ 不支持 | `[x = static_cast<double>(y)]` |
+| 捕获时重命名 | ❌ 不支持 | `[&r = x]` 或 `[v = x]` |
+| 完美转发捕获 | ❌ 不支持 | `[x = std::forward<T>(arg)]` |
